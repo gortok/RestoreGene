@@ -7,6 +7,7 @@ No changes should be necessary to either the PoSh script or the Stored Procedure
 The stored procedure generates the required restore scripts, including the DBCC CHECKDB command, if required. It is a useful tool by itself; in disaster recovery situations, it can construct a restore script to a given point in time, in seconds. Running it without any parameters generates a restore script for all user databases on an instance to the most recent point in time possible.
 
 sp_RestoreGene Parameters
+
 Parameter - Example - Description
 
 @Database - ‘workspace’ - Restore a specific database. Defaults to all user databases
@@ -51,6 +52,8 @@ database, defaults to actual database name
 The companion PowerShell driver script is to automate the database restore process. It calls the stored procedure on the primary, to generate the required script, then it runs the restore commands on a standby server. It will perform the tasks using the existing backup history in the primary msdb.dbo.backupset table to identify the backup files required. The PoSh script can only process one database at a time, database name is a required parameter.
 
 ps_RestoreGene Parameters
+
+
 Parameter Example Description 
 
 $PrimaryServer PBV001 Required – Primary server name 
