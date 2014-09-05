@@ -1,0 +1,879 @@
+USE [master] 
+GO 
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_NAME = 'sp_RestoreGene') 
+EXEC ('CREATE PROC dbo.sp_RestoreGene AS SELECT ''stub version, to be replaced''') 
+GO 
+   
+/*********************************************************************************************
+Restore Generator v3.6 (2014-08-29)
+(C) 2012, Paul Brewer, xml400.com ltd
+   
+Feedback: paulbrewer@yahoo.co.uk
+Updates: https://paulbrewer.wordpress.com/
+   
+This procedure queries msdb database backup history and database file details in master.
+It builds and returns RESTORE DATABASE commands as it's result set, it does not execute the commands.
+   
+CHANGE LOG:
+December 23, 2012   - V1.01 - Release
+January 4,2013      - V1.02 - LSN Checks + Bug fix to STOPAT date format
+January 11,2013     - V1.03 - SQL Server 2005 compatibility (backup compression problem) & @StandbyMode
+January 14, 2013    - V1.04 - WITH COPY and up to 10 striped backup files
+January 15, 2013    - V1.05 - Format of constructed restore script, enclose database name in [ ]
+February 7, 2013    - V1.06 - Modified WHERE Device_Type IN (7,102,2)
+May 26, 2013        - V1.07 - Various changes for PoSh Driver Script compatibility
+October 14, 2013    - V1.08 - Rename parameters, more meaningful names
+October 15, 2013    - V2.00 - Add 2nd CTE for striped backup files and remove repeating calls to CTE
+November 5, 2013    - V2.01 - Secondary .ndf files only included if @WithMoveDataFiles NOT NULL
+                            - Extended artificial LSN used for sequencing WITH RECOVERY/CHECKDB to 21 characters
+                            - Include database name in results for logging in PoSh
+May 23, 2014        - V3.0  - Improved logging and error handling, add 'LogShippingVariableDeclare' parameter
+                                Default is Yes when called from query analysier, set to No when called by PoSh
+May 30, 2014        - V3.1  - Restructured CTE, all predicates moved to the CTE
+June 6, 2014        - V3.2  - Add 'LogShippingStartTime' parameter for PowerShell script.
+                                To skip subsequent full and diff backups when restoring Logs in PoSh log shipping mode
+                            - Add 'Target Restore Database Name' parameter, Manuj Bahl suggestion
+                                If restoring a specific database, allows overriding restored name
+                                Probably used in conjunction with a @WithMove override of data and log files to a different folder.
+                            - Add LogShippingLastLSN parameter, used to filter results sent to ps_LogShippingLight
+June 10, 2014       - V3.3  - Standardize Log Shipping Parameter Names & make &msg variable declare unique
+June 27, 2014       - V3.31 - Diff restore bug fix
+July 13, 2014       - V3.32 - Feedback from Tony Davis
+                                Rename framework to memorable name 'RestoreGene'
+                                Paramater for WITH REPLACE
+August 5, 2014      - V3.4  - Remove TRY CATCH blocks from log restores and checkdb
+                            - Remove CTE's,use #temp tables, suggested by S.Stresser
+August 25, 2014     - V3.5  - goestock suggestion - Include device type 7 for AWS EC2 backups
+August 29th, 2014   - V3.6  - Richard found and fixed a problem with variable declare where database name has a space or full stop.
+********************************************************************************************/ 
+   
+ALTER PROC [dbo].[sp_RestoreGene]
+(
+    @Database SYSNAME = NULL,
+    @TargetDatabase SYSNAME = NULL,
+    @WithMoveDataFiles VARCHAR(2000) = NULL,
+    @WithMoveLogFile  VARCHAR(2000) = NULL,
+    @FromFileFullUNC VARCHAR(2000) = NULL,
+    @FromFileDiffUNC VARCHAR(2000) = NULL,
+    @FromFileLogUNC VARCHAR(2000) = NULL,
+    @StopAt DATETIME = NULL,
+    @StandbyMode BIT = 0,
+    @IncludeSystemDBs BIT = 0,
+    @WithRecovery BIT = 0,
+    @WithCHECKDB BIT = 0,
+    @WithReplace BIT = 0,
+    @UseDefaultDatabaseBackupPath BIT = 0,
+    @Log_Reference VARCHAR (250) = NULL,
+    @LogShippingVariableDeclare BIT = 1,
+    @LogShippingStartTime DATETIME = NULL,
+    @LogShippingLastLSN VARCHAR(25) = NULL
+)
+AS
+BEGIN
+   
+SET NOCOUNT ON; 
+   
+-- Defaults Times
+IF ISNULL(@StopAt,'') = ''
+    SET @StopAt = GETDATE(); 
+   
+IF ISNULL(@LogShippingStartTime,'') = ''
+    SET @LogShippingStartTime = @StopAt;
+   
+-- Default written to the SQL Server Error Log
+IF ISNULL(@Log_Reference,'') = ''
+    SET @Log_Reference = 'sp_RestoreGene - Recovery in Progress';     
+   
+-- Allow override of restored database name only if working with a specific database
+IF @TargetDatabase IS NOT NULL AND @Database IS NULL
+    SET @TargetDatabase = NULL;
+   
+-- ps_LogShippingLight - Filtered Results
+IF ISNULL(@LogShippingLastLSN,'') = ''
+    SET @LogShippingLastLSN = '-1';
+   
+--------------------------------------------------------------
+-- CTE1 Full Backup UNION Differential Backup UNION Log Backup
+--------------------------------------------------------------
+WITH CTE
+(
+     database_name
+    ,current_compatibility_level
+    ,Last_LSN
+    ,current_is_read_only
+    ,current_state_desc
+    ,current_recovery_model_desc
+    ,has_backup_checksums
+    ,backup_size
+    ,[type]
+    ,backupmediasetid
+    ,family_sequence_number
+    ,backupfinishdate
+    ,physical_device_name
+    ,position
+)
+AS
+( 
+   
+--------------------------------------------------------------
+-- Full backup - Most current immediately before @LogShippingStartTime
+SELECT
+    bs.database_name
+    ,d.[compatibility_level] AS current_compatibility_level
+    ,bs.last_lsn
+    ,d.[is_read_only] AS current_is_read_only
+    ,d.[state_desc] AS current_state_desc
+    ,d.[recovery_model_desc] current_recovery_model_desc
+    ,bs.has_backup_checksums
+    ,bs.backup_size AS backup_size
+    ,'D' AS [type]
+    ,bs.media_set_id AS backupmediasetid
+    ,mf.family_sequence_number
+    ,x.backup_finish_date AS backupfinishdate
+    ,mf.physical_device_name
+    ,bs.position
+FROM msdb.dbo.backupset bs 
+   
+INNER JOIN sys.databases d
+    ON bs.database_name = d.name
+   
+INNER JOIN
+(
+    SELECT
+        database_name
+        ,MAX(backup_finish_date) backup_finish_date
+    FROM msdb.dbo.backupset a
+    JOIN msdb.dbo.backupmediafamily b
+    ON a.media_set_id = b.media_set_id
+    WHERE a.[type] = 'D'
+    AND Device_Type IN (7,102,2)
+    AND a.is_copy_only = 0
+    AND a.backup_finish_date <= @LogShippingStartTime
+    GROUP BY database_name
+) x
+    ON x.database_name = bs.database_name
+    AND x.backup_finish_date = bs.backup_finish_date 
+   
+JOIN msdb.dbo.backupmediafamily mf
+    ON mf.media_set_id = bs.media_set_id
+    AND mf.family_sequence_number Between bs.first_family_number And bs.last_family_number      
+   
+WHERE bs.type = 'D'
+AND mf.physical_device_name NOT IN ('Nul', 'Nul:') 
+   
+UNION
+   
+--------------------------------------------------------------
+-- Differential backup, most current immediately before @StopAt
+SELECT
+    bs.database_name
+    ,d.[compatibility_level] AS current_compatibility_level
+    ,bs.last_lsn
+    ,d.[is_read_only] AS current_is_read_only
+    ,d.[state_desc] AS current_state_desc
+    ,d.[recovery_model_desc] current_recovery_model_desc
+    ,bs.has_backup_checksums
+    ,bs.backup_size AS backup_size
+    ,'I' AS [type]
+    ,bs.media_set_id AS backupmediasetid
+    ,mf.family_sequence_number
+    ,x.backup_finish_date AS backupfinishdate
+    ,mf.physical_device_name
+    ,bs.position
+FROM msdb.dbo.backupset bs 
+   
+INNER JOIN sys.databases d
+    ON bs.database_name = d.name
+   
+INNER JOIN -- Last Diff before STOPAT
+(
+    SELECT
+        database_name
+        ,MAX(backup_finish_date) backup_finish_date
+    FROM msdb.dbo.backupset a
+    JOIN msdb.dbo.backupmediafamily b
+    ON a.media_set_id = b.media_set_id
+    WHERE a.[type] = 'I'
+    AND Device_Type IN (7,102,2)
+    AND a.is_copy_only = 0
+    AND a.backup_finish_date <= ISNULL(@StopAt,GETDATE())
+    GROUP BY database_name
+) x
+    ON x.database_name = bs.database_name
+    AND x.backup_finish_date = bs.backup_finish_date 
+   
+INNER JOIN  -- Last Full before STOPAT
+(
+    SELECT
+        database_name
+        ,MAX(backup_finish_date) backup_finish_date
+    FROM msdb.dbo.backupset a
+    JOIN msdb.dbo.backupmediafamily b
+    ON a.media_set_id = b.media_set_id
+    WHERE a.[type] = 'D'
+    AND Device_Type IN (7,102,2)
+    AND a.is_copy_only = 0
+    AND a.backup_finish_date <= @LogShippingStartTime
+    GROUP BY database_name
+) y
+    ON y.database_name = bs.database_name 
+   
+INNER JOIN msdb.dbo.backupmediafamily mf
+    ON mf.media_set_id = bs.media_set_id
+    AND mf.family_sequence_number Between bs.first_family_number And bs.last_family_number 
+   
+WHERE bs.type = 'I'
+AND mf.physical_device_name NOT IN ('Nul', 'Nul:')
+AND x.backup_finish_date > y.backup_finish_date
+AND @StopAt = @LogShippingStartTime
+   
+UNION
+   
+--------------------------------------------------------------
+-- Log file backups - after 1st full & diff backups / before @STOPAT
+SELECT
+    bs.database_name
+    ,d.[compatibility_level] AS current_compatibility_level
+    ,bs.last_lsn
+    ,d.[is_read_only] AS current_is_read_only
+    ,d.[state_desc] AS current_state_desc
+    ,d.[recovery_model_desc] current_recovery_model_desc
+    ,bs.has_backup_checksums
+    ,bs.backup_size AS backup_size
+    ,'L' AS [type]
+    ,bs.media_set_id AS backupmediasetid
+    ,mf.family_sequence_number
+    ,bs.backup_finish_date as backupfinishdate
+    ,mf.physical_device_name
+    ,bs.position 
+   
+FROM msdb.dbo.backupset bs 
+   
+INNER JOIN sys.databases d
+    ON bs.database_name = d.name
+   
+INNER JOIN msdb.dbo.backupmediafamily mf
+    ON mf.media_set_id = bs.media_set_id
+    AND mf.family_sequence_number Between bs.first_family_number And bs.last_family_number 
+   
+INNER JOIN -- After the selected full backup
+(
+    SELECT
+        database_name
+        ,MAX(Last_LSN) full_backup_Last_LSN
+    FROM msdb.dbo.backupset a
+    JOIN msdb.dbo.backupmediafamily b
+    ON a.media_set_id = b.media_set_id
+    WHERE a.[type] = 'D'
+    AND Device_Type IN (7,102,2)
+    AND a.is_copy_only = 0
+    AND a.backup_finish_date <= @LogShippingStartTime
+    GROUP BY database_name
+) y
+    ON bs.database_name = y.Database_name 
+   
+LEFT OUTER JOIN -- After the selected differential backup
+(
+    SELECT
+        database_name
+        ,MAX(Last_LSN) diff_backup_Last_LSN
+    FROM msdb.dbo.backupset a
+    JOIN msdb.dbo.backupmediafamily b
+    ON a.media_set_id = b.media_set_id
+    WHERE a.[type] = 'I'
+    AND Device_Type IN (7,102,2)
+    AND a.is_copy_only = 0
+    AND a.backup_finish_date < CASE @LogShippingStartTime WHEN @StopAt THEN ISNULL(@StopAt,'1 Jan, 1900') ELSE '1 Jan, 1900' END
+    GROUP BY database_name
+) z
+    ON bs.database_name = z.database_name 
+   
+LEFT OUTER JOIN -- Select the first log file after STOPAT
+(
+    SELECT
+        database_name
+        ,MIN(backup_finish_date) last_Log_After_StopAt
+    FROM msdb.dbo.backupset a
+    JOIN msdb.dbo.backupmediafamily b
+    ON a.media_set_id = b.media_set_id
+    WHERE a.[type] = 'L'
+    AND Device_Type IN (7,102,2)
+    AND a.backup_finish_date > ISNULL(@StopAt,'1 Jan, 1900')
+    GROUP BY database_name
+) x
+    ON bs.database_name = x.database_name 
+   
+WHERE bs.backup_finish_date <= ISNULL(x.last_Log_After_StopAt,'31 Dec, 2050') -- Include 1st log after stop at
+AND bs.Last_LSN > y.full_backup_Last_LSN -- After last full backup lsn
+AND bs.Last_LSN > ISNULL(z.diff_backup_Last_LSN,'0') -- After last diff backup lsn if exists
+AND mf.physical_device_name NOT IN ('Nul', 'Nul:')
+AND bs.type = 'L'
+AND Device_Type IN (7,102,2)
+)
+   
+SELECT * INTO #CTE FROM CTE; 
+   
+--------------------------------------------------------------
+-- CTE2 Optionally, striped backup file details
+--------------------------------------------------------------
+WITH Stripes
+(
+    database_name,
+    backupmediasetid,
+    family_sequence_number,
+    last_lsn,
+    S2_pdn,
+    S3_pdn,
+    S4_pdn,
+    S5_pdn,
+    S6_pdn,
+    S7_pdn,
+    S8_pdn,
+    S9_pdn,
+    S10_pdn
+)
+AS
+(
+SELECT
+    Stripe1.database_name,
+    Stripe1.backupmediasetid,
+    Stripe1.family_sequence_number,
+    Stripe1.Last_LSN,
+    Stripe2.physical_device_name AS S2_pdn,
+    Stripe3.physical_device_name AS S3_pdn,
+    Stripe4.physical_device_name AS S4_pdn,
+    Stripe5.physical_device_name AS S5_pdn,
+    Stripe6.physical_device_name AS S6_pdn,
+    Stripe7.physical_device_name AS S7_pdn,
+    Stripe8.physical_device_name AS S8_pdn,
+    Stripe9.physical_device_name AS S9_pdn,
+    Stripe10.physical_device_name  AS S10_pdn
+FROM #CTE AS Stripe1 
+   
+LEFT OUTER JOIN #CTE AS Stripe2
+    ON Stripe2.database_name = Stripe1.Database_name
+    AND Stripe2.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe2.family_sequence_number = 2 
+   
+LEFT OUTER JOIN #CTE AS Stripe3
+    ON Stripe3.database_name = Stripe1.Database_name
+    AND Stripe3.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe3.family_sequence_number = 3 
+   
+LEFT OUTER JOIN #CTE AS Stripe4
+    ON Stripe4.database_name = Stripe1.Database_name
+    AND Stripe4.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe4.family_sequence_number = 4 
+   
+LEFT OUTER JOIN #CTE AS Stripe5
+    ON Stripe5.database_name = Stripe1.Database_name
+    AND Stripe5.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe5.family_sequence_number = 5 
+   
+LEFT OUTER JOIN #CTE AS Stripe6
+    ON Stripe6.database_name = Stripe1.Database_name
+    AND Stripe6.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe6.family_sequence_number = 6 
+   
+LEFT OUTER JOIN #CTE AS Stripe7
+    ON Stripe7.database_name = Stripe1.Database_name
+    AND Stripe7.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe7.family_sequence_number = 7 
+   
+LEFT OUTER JOIN #CTE AS Stripe8
+    ON Stripe8.database_name = Stripe1.Database_name
+    AND Stripe8.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe8.family_sequence_number = 8 
+   
+LEFT OUTER JOIN #CTE AS Stripe9
+    ON Stripe9.database_name = Stripe1.Database_name
+    AND Stripe9.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe9.family_sequence_number = 9 
+   
+LEFT OUTER JOIN #CTE AS Stripe10
+    ON Stripe10.database_name = Stripe1.Database_name
+    AND Stripe10.backupmediasetid = Stripe1.backupmediasetid
+    AND Stripe10.family_sequence_number = 10
+) 
+   
+SELECT * INTO #Stripes FROM Stripes;  
+   
+--------------------------------------------------------------
+-- Results, T-SQL RESTORE commands, below are based on CTE's above
+-------------------------------------------------------------- 
+   
+SELECT
+    a.Command AS TSQL,
+    CONVERT(nvarchar(30), a.backupfinishdate, 126)
+    AS BackupDate,
+    a.BackupDevice,
+    a.Last_LSN,
+    a.Database_Name ,
+    ROW_NUMBER() OVER(ORDER BY database_name, sequence, Last_LSN) AS SortSequence
+FROM
+( 
+   
+--------------------------------------------------------------
+-- Most recent full backup
+-------------------------------------------------------------- 
+   
+SELECT
+     '; SET @msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ' = ' + '''' + @Log_Reference + '''' + ';  RAISERROR (@msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + + ',0,0) WITH LOG' + ';RESTORE DATABASE [' + CASE ISNULL(@TargetDatabase,'') WHEN '' THEN d.[name] ELSE @TargetDatabase END + ']' + SPACE(1) +
+    'FROM DISK = N' + '''' +
+    CASE ISNULL(@FromFileFullUNC,'Actual')
+    WHEN 'Actual' THEN #CTE.physical_device_name
+    ELSE @FromFileFullUNC + SUBSTRING(#CTE.physical_device_name,LEN(#CTE.physical_device_name) - CHARINDEX('\',REVERSE(#CTE.physical_device_name),1) + 2,CHARINDEX('\',REVERSE(#CTE.physical_device_name),1) + 1)
+    END + '''' + SPACE(1) + 
+   
+    -- Striped backup files
+    CASE ISNULL(#Stripes.S2_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S2_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S2_pdn,LEN(#Stripes.S2_pdn) - CHARINDEX('\',REVERSE(#Stripes.S2_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S2_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S3_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S3_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S3_pdn,LEN(#Stripes.S3_pdn) - CHARINDEX('\',REVERSE(#Stripes.S3_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S3_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S4_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S4_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S4_pdn,LEN(#Stripes.S4_pdn) - CHARINDEX('\',REVERSE(#Stripes.S4_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S4_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S5_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S5_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S5_pdn,LEN(#Stripes.S5_pdn) - CHARINDEX('\',REVERSE(#Stripes.S5_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S5_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S6_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S6_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S6_pdn,LEN(#Stripes.S6_pdn) - CHARINDEX('\',REVERSE(#Stripes.S6_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S6_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S7_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S7_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S7_pdn,LEN(#Stripes.S7_pdn) - CHARINDEX('\',REVERSE(#Stripes.S7_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S7_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S8_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S8_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S8_pdn,LEN(#Stripes.S8_pdn) - CHARINDEX('\',REVERSE(#Stripes.S8_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S8_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S9_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S9_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S9_pdn,LEN(#Stripes.S9_pdn) - CHARINDEX('\',REVERSE(#Stripes.S9_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S9_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S10_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileFullUNC,'Actual') WHEN 'Actual' THEN #Stripes.S10_pdn ELSE @FromFileFullUNC + SUBSTRING(#Stripes.S10_pdn,LEN(#Stripes.S10_pdn) - CHARINDEX('\',REVERSE(#Stripes.S10_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S10_pdn),1) + 1) END + ''''
+    END + 
+   
+    ' WITH ' + CASE ISNULL(@WithReplace,0) WHEN 1 THEN 'REPLACE, ' ELSE '' END   + 'FILE = ' + CAST(#CTE.Position AS VARCHAR(5)) + ',' +
+    CASE #CTE.has_backup_checksums WHEN 1 THEN 'CHECKSUM, ' ELSE ' ' END + 
+   
+    CASE @StandbyMode WHEN 0 THEN 'NORECOVERY,' ELSE 'STANDBY =N' + '''' + ISNULL(@FromFileFullUNC,SUBSTRING(#CTE.physical_device_name,1,LEN(#CTE.physical_device_name) - CHARINDEX('\',REVERSE(#CTE.physical_device_name)))) + '\' + d.name + '_ROLLBACK_UNDO.bak ' + '''' + ',' END + SPACE(1) + 
+   
+    'STATS=10,' + SPACE(1) +
+    'MOVE N' + '''' + x.LogicalName + '''' + ' TO ' +
+    '''' +
+    CASE ISNULL(@WithMoveDataFiles,'Actual')
+    WHEN 'Actual' THEN x.PhysicalName
+    ELSE @WithMoveDataFiles + SUBSTRING(x.PhysicalName,LEN(x.PhysicalName) - CHARINDEX('\',REVERSE(x.PhysicalName),1) + 2,CHARINDEX('\',REVERSE(x.PhysicalName),1) + 1)
+    END + '''' + ',' + SPACE(1) + 
+   
+    'MOVE N' + '''' + y.LogicalName + '''' + ' TO ' +
+    '''' +
+    CASE ISNULL(@WithMoveLogFile ,'Actual')
+    WHEN 'Actual' THEN y.PhysicalName
+    ELSE @WithMoveLogFile  + SUBSTRING(y.PhysicalName,LEN(y.PhysicalName) - CHARINDEX('\',REVERSE(y.PhysicalName),1) + 2,CHARINDEX('\',REVERSE(y.PhysicalName),1) + 1)
+    END + '''' AS Command,
+    1 AS Sequence,
+    d.name AS database_name,
+    #CTE.physical_device_name AS BackupDevice,
+    #CTE.backupfinishdate,
+    #CTE.backup_size,
+    #CTE.Last_LSN 
+   
+FROM sys.databases d 
+   
+JOIN
+(
+    SELECT
+        DB_NAME(mf.database_id) AS name
+        ,mf.Physical_Name AS PhysicalName
+        ,mf.Name AS LogicalName
+    FROM sys.master_files mf
+    WHERE type_desc = 'ROWS'
+    AND mf.file_id = 1
+) x
+    ON d.name = x.name 
+   
+JOIN
+(
+    SELECT
+        DB_NAME(mf.database_id) AS name, type_desc
+        ,mf.Physical_Name PhysicalName
+        ,mf.Name AS LogicalName
+    FROM sys.master_files mf
+    WHERE type_desc = 'LOG'
+) y
+    ON d.name = y.name 
+   
+LEFT OUTER JOIN #CTE
+    ON #CTE.database_name = d.name
+    AND #CTE.family_sequence_number = 1 
+   
+JOIN #Stripes
+    ON #Stripes.database_name = d.name
+    AND #Stripes.backupmediasetid = #CTE.backupmediasetid
+    AND #Stripes.last_lsn = #CTE.Last_LSN 
+   
+WHERE #CTE.[type] = 'D'
+AND #CTE.family_sequence_number = 1 
+   
+--------------------------------------------------------------
+-- Most recent differential backup
+--------------------------------------------------------------
+UNION 
+   
+SELECT
+    '; SET @msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ' = ' + '''' + @Log_Reference  + '''' + ';  RAISERROR (@msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ',0,0) WITH LOG' + ';RESTORE DATABASE [' + CASE ISNULL(@TargetDatabase,'') WHEN '' THEN d.[name] ELSE @TargetDatabase END + ']' + SPACE(1) +
+    'FROM DISK = N' + '''' +
+    CASE ISNULL(@FromFileDiffUNC,'Actual')
+    WHEN 'Actual' THEN #CTE.physical_device_name
+    ELSE @FromFileDiffUNC + SUBSTRING(#CTE.physical_device_name,LEN(#CTE.physical_device_name) - CHARINDEX('\',REVERSE(#CTE.physical_device_name),1) + 2,CHARINDEX('\',REVERSE(#CTE.physical_device_name),1) + 1)
+    END + '''' + SPACE(1) + 
+   
+    -- Striped backup files
+    CASE ISNULL(#Stripes.S2_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S2_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S2_pdn,LEN(#Stripes.S2_pdn) - CHARINDEX('\',REVERSE(#Stripes.S2_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S2_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S3_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S3_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S3_pdn,LEN(#Stripes.S3_pdn) - CHARINDEX('\',REVERSE(#Stripes.S3_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S3_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S4_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S4_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S4_pdn,LEN(#Stripes.S4_pdn) - CHARINDEX('\',REVERSE(#Stripes.S4_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S4_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S5_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S5_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S5_pdn,LEN(#Stripes.S5_pdn) - CHARINDEX('\',REVERSE(#Stripes.S5_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S5_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S6_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S6_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S6_pdn,LEN(#Stripes.S6_pdn) - CHARINDEX('\',REVERSE(#Stripes.S6_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S6_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S7_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S7_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S7_pdn,LEN(#Stripes.S7_pdn) - CHARINDEX('\',REVERSE(#Stripes.S7_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S7_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S8_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S8_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S8_pdn,LEN(#Stripes.S8_pdn) - CHARINDEX('\',REVERSE(#Stripes.S8_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S8_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S9_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S9_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S9_pdn,LEN(#Stripes.S9_pdn) - CHARINDEX('\',REVERSE(#Stripes.S9_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S9_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S10_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileDiffUNC,'Actual') WHEN 'Actual' THEN #Stripes.S10_pdn ELSE @FromFileDiffUNC + SUBSTRING(#Stripes.S10_pdn,LEN(#Stripes.S10_pdn) - CHARINDEX('\',REVERSE(#Stripes.S10_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S10_pdn),1) + 1) END + ''''
+    END + 
+   
+    ' WITH FILE = ' + CAST(#CTE.Position AS VARCHAR(5)) + ',' +
+    CASE #CTE.has_backup_checksums WHEN 1 THEN 'CHECKSUM, ' ELSE ' ' END + 
+   
+    CASE @StandbyMode WHEN 0 THEN 'NORECOVERY,' ELSE 'STANDBY =N' + '''' + ISNULL(@FromFileFullUNC,SUBSTRING(#CTE.physical_device_name,1,LEN(#CTE.physical_device_name) - CHARINDEX('\',REVERSE(#CTE.physical_device_name)))) + '\' + d.name + '_ROLLBACK_UNDO.bak ' + ''''  + ',' END + SPACE(1) + 
+   
+    'STATS=10,' + SPACE(1) +
+    'MOVE N' + '''' + x.LogicalName + '''' + ' TO ' +
+    '''' +
+    CASE ISNULL(@WithMoveDataFiles,'Actual')
+    WHEN 'Actual' THEN x.PhysicalName
+    ELSE @WithMoveDataFiles + SUBSTRING(x.PhysicalName,LEN(x.PhysicalName) - CHARINDEX('\',REVERSE(x.PhysicalName),1) + 2,CHARINDEX('\',REVERSE(x.PhysicalName),1) + 1)
+    END + '''' + ',' + SPACE(1) + 
+   
+    'MOVE N' + '''' + y.LogicalName + '''' + ' TO ' +
+    '''' +
+    CASE ISNULL(@WithMoveLogFile ,'Actual')
+    WHEN 'Actual' THEN y.PhysicalName
+    ELSE @WithMoveLogFile  + SUBSTRING(y.PhysicalName,LEN(y.PhysicalName) - CHARINDEX('\',REVERSE(y.PhysicalName),1) + 2,CHARINDEX('\',REVERSE(y.PhysicalName),1) + 1)
+    END + '''' AS Command,
+    32769/2 AS Sequence,
+    d.name AS database_name,
+    #CTE.physical_device_name AS BackupDevice,
+    #CTE.backupfinishdate,
+    #CTE.backup_size,
+    #CTE.Last_LSN 
+   
+FROM sys.databases d 
+   
+JOIN #CTE
+ON #CTE.database_name = d.name
+AND #CTE.family_sequence_number = 1 
+   
+LEFT OUTER JOIN #Stripes
+ON #Stripes.database_name = d.name
+AND #Stripes.backupmediasetid = #CTE.backupmediasetid
+AND #Stripes.last_lsn = #CTE.Last_LSN 
+   
+INNER JOIN
+(
+    SELECT
+        DB_NAME(mf.database_id) AS name
+        ,mf.Physical_Name AS PhysicalName
+        ,mf.Name AS LogicalName
+    FROM sys.master_files mf
+    WHERE type_desc = 'ROWS'
+    AND mf.file_id = 1
+) x
+    ON d.name = x.name 
+   
+JOIN
+(
+    SELECT
+        DB_NAME(mf.database_id) AS name, type_desc
+        ,mf.Physical_Name PhysicalName
+        ,mf.Name AS LogicalName
+    FROM sys.master_files mf
+    WHERE type_desc = 'LOG'
+) y
+    ON d.name = y.name 
+   
+WHERE #CTE.[type] = 'I'
+AND #CTE.family_sequence_number = 1 
+   
+--------------------------------------------------------------
+UNION -- Log backups taken since most recent full or diff
+-------------------------------------------------------------- 
+   
+SELECT
+    '; SET @msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ' = ' + '''' + @Log_Reference + '''' + ';  RAISERROR (@msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ',0,0) WITH LOG'  + ';RESTORE LOG [' + CASE ISNULL(@TargetDatabase,'') WHEN '' THEN d.[name] ELSE @TargetDatabase END + ']' + SPACE(1) +
+    'FROM DISK = N' + '''' + --#CTE.physical_device_name + '''' + SPACE(1) +
+    CASE ISNULL(@FromFileLogUNC,'Actual')
+    WHEN 'Actual' THEN #CTE.physical_device_name
+    ELSE @FromFileLogUNC + SUBSTRING(#CTE.physical_device_name,LEN(#CTE.physical_device_name) - CHARINDEX('\',REVERSE(#CTE.physical_device_name),1) + 2,CHARINDEX('\',REVERSE(#CTE.physical_device_name),1) + 1)
+    END + '''' + 
+   
+    -- Striped backup files
+    CASE ISNULL(#Stripes.S2_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S2_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S2_pdn,LEN(#Stripes.S2_pdn) - CHARINDEX('\',REVERSE(#Stripes.S2_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S2_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S3_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S3_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S3_pdn,LEN(#Stripes.S3_pdn) - CHARINDEX('\',REVERSE(#Stripes.S3_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S3_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S4_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S4_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S4_pdn,LEN(#Stripes.S4_pdn) - CHARINDEX('\',REVERSE(#Stripes.S4_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S4_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S5_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S5_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S5_pdn,LEN(#Stripes.S5_pdn) - CHARINDEX('\',REVERSE(#Stripes.S5_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S5_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S6_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S6_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S6_pdn,LEN(#Stripes.S6_pdn) - CHARINDEX('\',REVERSE(#Stripes.S6_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S6_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S7_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S7_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S7_pdn,LEN(#Stripes.S7_pdn) - CHARINDEX('\',REVERSE(#Stripes.S7_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S7_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S8_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S8_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S8_pdn,LEN(#Stripes.S8_pdn) - CHARINDEX('\',REVERSE(#Stripes.S8_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S8_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S9_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S9_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S9_pdn,LEN(#Stripes.S9_pdn) - CHARINDEX('\',REVERSE(#Stripes.S9_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S9_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE ISNULL(#Stripes.S10_pdn,'')
+    WHEN '' THEN ''
+    ELSE  ', DISK = N' + '''' + CASE ISNULL(@FromFileLogUNC,'Actual') WHEN 'Actual' THEN #Stripes.S10_pdn ELSE @FromFileLogUNC + SUBSTRING(#Stripes.S10_pdn,LEN(#Stripes.S10_pdn) - CHARINDEX('\',REVERSE(#Stripes.S10_pdn),1) + 2,CHARINDEX('\',REVERSE(#Stripes.S10_pdn),1) + 1) END + ''''
+    END + 
+   
+    CASE @StandbyMode WHEN 0 THEN ' WITH NORECOVERY,' ELSE ' WITH STANDBY =N' + '''' + ISNULL(@FromFileFullUNC,SUBSTRING(#CTE.physical_device_name,1,LEN(#CTE.physical_device_name) - CHARINDEX('\',REVERSE(#CTE.physical_device_name)))) + '\' + d.name + '_ROLLBACK_UNDO.bak ' + ''''  + ',' END + SPACE(1) + 
+   
+    CASE #CTE.has_backup_checksums WHEN 1 THEN ' CHECKSUM, ' ELSE ' ' END + 
+   
+    + 'FILE = ' + CAST(#CTE.Position AS VARCHAR(5)) +
+    ' ,STOPAT = ' + '''' + CONVERT(VARCHAR(21),@StopAt,120) + '''' +
+    ' ,MOVE N' + '''' + x2.LogicalName + '''' + ' TO ' +
+    '''' +
+    CASE ISNULL(@WithMoveDataFiles,'Actual')
+    WHEN 'Actual' THEN x2.PhysicalName
+    ELSE @WithMoveDataFiles + SUBSTRING(x2.PhysicalName,LEN(x2.PhysicalName) - CHARINDEX('\',REVERSE(x2.PhysicalName),1) + 2,CHARINDEX('\',REVERSE(x2.PhysicalName),1) + 1)
+    END + '''' + ',' + SPACE(1) + 
+   
+    ' MOVE N' + '''' + y1.LogicalName + '''' + ' TO ' +
+    '''' +
+    CASE ISNULL(@WithMoveLogFile ,'Actual')
+    WHEN 'Actual' THEN y1.PhysicalName
+    ELSE @WithMoveLogFile  + SUBSTRING(y1.PhysicalName,LEN(y1.PhysicalName) - CHARINDEX('\',REVERSE(y1.PhysicalName),1) + 2,CHARINDEX('\',REVERSE(y1.PhysicalName),1) + 1)
+    END + '''' + ';' AS Command,
+    32769 AS Sequence,
+    d.name AS database_name,
+    #CTE.physical_device_name AS BackupDevice,
+    #CTE.backupfinishdate,
+    #CTE.backup_size,
+    #CTE.Last_LSN 
+   
+FROM sys.databases d 
+   
+INNER JOIN
+(
+    SELECT
+        DB_NAME(mf.database_id) AS name
+        ,mf.Physical_Name AS PhysicalName
+        ,mf.Name AS LogicalName
+    FROM sys.master_files mf
+    WHERE type_desc = 'ROWS'
+    AND mf.file_id = 1
+) x2
+ON d.name = x2.name 
+   
+INNER JOIN
+(
+    SELECT
+        DB_NAME(mf.database_id) AS name, type_desc
+        ,mf.Physical_Name PhysicalName
+        ,mf.Name AS LogicalName
+    FROM sys.master_files mf
+    WHERE type_desc = 'LOG'
+) y1
+    ON d.name = y1.name 
+   
+INNER JOIN #CTE
+    ON #CTE.database_name = d.name
+    AND #CTE.family_sequence_number = 1 
+   
+LEFT OUTER JOIN #Stripes
+    ON #Stripes.database_name = d.name
+    AND #Stripes.backupmediasetid = #CTE.backupmediasetid
+    AND #Stripes.last_lsn = #CTE.Last_LSN 
+   
+WHERE #CTE.[type] = 'L'
+AND #CTE.family_sequence_number = 1 
+   
+--------------------------------------------------------------
+UNION -- Declare @msg_ variable
+--------------------------------------------------------------
+SELECT
+--   '; DECLARE @msg_' + d.name + ' VARCHAR(1000)' AS Command,
+   '; DECLARE @msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ' VARCHAR(1000)' AS Command,
+    0 AS Sequence,
+    d.name AS database_name,
+    '' AS BackupDevice,
+    GETDATE() AS backupfinishdate,
+    #CTE.backup_size,
+    '0' AS Last_LSN 
+   
+FROM sys.databases d 
+   
+JOIN #CTE
+ON #CTE.database_name = d.name 
+   
+WHERE #CTE.[type] = 'D'
+AND @LogShippingVariableDeclare = 1 
+   
+--------------------------------------------------------------
+UNION -- Restore WITH RECOVERY
+--------------------------------------------------------------
+SELECT
+   '; SET @msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ' = ' + '''' + @Log_Reference  + '''' + ';  RAISERROR (@msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ',0,0) WITH LOG' + ';RESTORE DATABASE [' + CASE ISNULL(@TargetDatabase,'') WHEN '' THEN d.[name] ELSE @TargetDatabase END + ']' + SPACE(1) + 'WITH RECOVERY' AS Command,
+    32771 AS Sequence,
+    d.name AS database_name,
+    '' AS BackupDevice,
+    GETDATE() AS backupfinishdate,
+    #CTE.backup_size,
+    '999999999999999999998' AS Last_LSN 
+   
+FROM sys.databases d 
+   
+JOIN #CTE
+ON #CTE.database_name = d.name 
+   
+WHERE #CTE.[type] = 'D'
+AND @WithRecovery = 1 
+   
+--------------------------------------------------------------
+UNION -- CHECKDB
+--------------------------------------------------------------
+SELECT
+    '; SET @msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ' = ' + '''' + @Log_Reference  + '''' + ';  RAISERROR (@msg_' + REPLACE(REPLACE(d.name,' ','_'),'.','_') + ',0,0) WITH LOG' + ';DBCC CHECKDB(' + '''' + CASE ISNULL(@TargetDatabase,'') WHEN '' THEN d.[name] ELSE @TargetDatabase END + '''' + ') WITH NO_INFOMSGS, ALL_ERRORMSGS' AS Command,
+    32772 AS Sequence,
+    d.name AS database_name,
+    '' AS BackupDevice,
+    DATEADD(minute,1,GETDATE()) AS backupfinishdate,
+    #CTE.backup_size,
+    '999999999999999999999' AS Last_LSN 
+   
+FROM sys.databases d 
+   
+JOIN #CTE
+ON #CTE.database_name = d.name 
+   
+WHERE #CTE.[type] = 'D'
+AND @WithCHECKDB = 1
+AND @WithRecovery = 1 
+   
+--------------------------------------------------------------
+UNION -- WITH MOVE secondary data files, allows for up to 32769/2 file groups
+--------------------------------------------------------------
+SELECT
+    ', MOVE N' + '''' + b.name + '''' + ' TO N' + '''' +
+    CASE ISNULL(@WithMoveDataFiles,'Actual')
+    WHEN 'Actual' THEN b.physical_name
+    ELSE @WithMoveDataFiles + SUBSTRING(b.Physical_Name,LEN(b.Physical_Name) - CHARINDEX('\',REVERSE(b.Physical_Name),1) + 2,CHARINDEX('\',REVERSE(b.Physical_Name),1) + 1)
+    END + '''',
+    b.file_id AS Sequence,
+    DB_NAME(b.database_id) AS database_name,
+    'SECONDARY FULL' AS BackupDevice,
+    #CTE.backupfinishdate,
+    #CTE.backup_size,
+    #CTE.Last_LSN 
+   
+FROM sys.master_files b
+INNER JOIN #CTE
+ON #CTE.database_name = DB_NAME(b.database_id) 
+   
+WHERE #CTE.[type] = 'D'
+AND b.type_desc = 'ROWS'
+AND b.file_id > 2
+AND @WithMoveDataFiles IS NOT NULL
+--------------------------------------------------------------
+) a
+-------------------------------------------------------------- 
+   
+WHERE a.database_name = ISNULL(@database,a.database_name)
+AND (@IncludeSystemDBs = 1 OR a.database_name NOT IN('master','model','msdb'))
+AND a.Last_LSN > @LogShippingLastLSN
+   
+ORDER BY
+    database_name,
+    sequence,
+    Last_LSN  
+   
+END
