@@ -4,6 +4,8 @@ This is a simple two-script framework, one T-SQL and one PowerShell (PoSh), for 
 
 No changes should be necessary to either the PoSh script or the Stored Procedure. Just create them, and then call them, passing parameters to suit your purpose. The T-SQL script can be invoked from query analyser, copy the TSQL column in the results it returns then paste and run. The PoSh drive script can be invoked from a SQL Agent job step, an SSIS package or any PoSh shell.
 
+
+
 The stored procedure generates the required restore scripts, including the DBCC CHECKDB command, if required. It is a useful tool by itself; in disaster recovery situations, it can construct a restore script to a given point in time, in seconds. Running it without any parameters generates a restore script for all user databases on an instance to the most recent point in time possible.
 
 sp_RestoreGene Parameters
@@ -44,6 +46,8 @@ database, defaults to actual database name
 @LogShippingVariableDeclare - PoSh Script Parameter - Used to suppress DECLARE @MSG in result set
 
 @LogShippingLastLSN - PoSh Script Parameter - Used to filter results sent, exclude log backups already restored
+
+
 
 
 
